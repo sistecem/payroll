@@ -503,7 +503,7 @@ class HrPayslip(models.Model):
         return sorted_rules
 
     def _compute_payslip_line(self, rule, localdict, lines_dict):
-        self.ensure_one()
+        #self.ensure_one() #mbj quite el ensure one
         # check if there is already a rule computed with that code
         previous_amount = rule.code in localdict and localdict[rule.code] or 0.0
         # compute the amount of the rule
@@ -646,7 +646,7 @@ class HrPayslip(models.Model):
         return res
 
     def _sum_salary_rule_category(self, localdict, category, amount):
-        self.ensure_one()
+        #self.ensure_one() #mbj quite el ensure one
         if category.parent_id:
             localdict = self._sum_salary_rule_category(
                 localdict, category.parent_id, amount
