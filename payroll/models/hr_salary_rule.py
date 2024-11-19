@@ -12,7 +12,6 @@ class HrSalaryRule(models.Model):
 
     name = fields.Char(required=True, translate=True)
     code = fields.Char(
-        required=True,
         help="The code of salary rules can be used as reference in computation "
         "of other rules. In that case, it is case sensitive.",
     )
@@ -26,9 +25,7 @@ class HrSalaryRule(models.Model):
         "1€ per worked day can have its quantity defined in expression "
         "like worked_days.WORK100.number_of_days.",
     )
-    category_id = fields.Many2one(
-        "hr.salary.rule.category", string="Category", required=True
-    )
+    category_id = fields.Many2one("hr.salary.rule.category", string="Category")
     active = fields.Boolean(
         default=True,
         help="If the active field is set to false, it will allow you to hide"
@@ -66,20 +63,20 @@ class HrSalaryRule(models.Model):
         required=True,
         default="""
             # Available variables:
-            #----------------------
-            # payslip: object containing the payslips
-            # payslip.rule_parameter(code): get the value for the rule parameter specified.
-            #   By default it gets the code for payslip date.
+            #-------------------------------
+            # payslip: hr.payslip object
+            # payslips: object containing payslips (browsable)
             # employee: hr.employee object
             # contract: hr.contract object
             # rules: object containing the rules code (previously computed)
             # categories: object containing the computed salary rule categories
             #    (sum of amount of all rules belonging to that category).
-            # worked_days: object containing the computed worked days
-            # inputs: object containing the computed inputs
+            # worked_days: object containing the computed worked days.
+            # inputs: object containing the computed inputs.
             # payroll: object containing miscellaneous values related to payroll
             # current_contract: object with values calculated from the current contract
             # result_rules: object with a dict of qty, rate, amount an total of calculated rules
+            # tools: object that contain libraries and tools that can be used in calculations
 
             # Available compute variables:
             #-------------------------------
@@ -87,7 +84,7 @@ class HrSalaryRule(models.Model):
 
             # Example:
             #-------------------------------
-            result = rules.NET > categories.NET * 0.10
+            # result = worked_days.WORK0 and worked_days.WORK0.number_of_days > 0
 
             """,
         help="Applied this rule for calculation if condition is true. You can "
@@ -122,7 +119,8 @@ class HrSalaryRule(models.Model):
         default="""
             # Available variables:
             #-------------------------------
-            # payslip: object containing the payslips
+            # payslip: hr.payslip object
+            # payslips: object containing payslips (browsable)
             # employee: hr.employee object
             # contract: hr.contract object
             # rules: object containing the rules code (previously computed)
@@ -133,6 +131,7 @@ class HrSalaryRule(models.Model):
             # payroll: object containing miscellaneous values related to payroll
             # current_contract: object with values calculated from the current contract
             # result_rules: object with a dict of qty, rate, amount an total of calculated rules
+            # tools: object that contain libraries and tools that can be used in calculations
 
             # Available compute variables:
             #-------------------------------
@@ -143,7 +142,7 @@ class HrSalaryRule(models.Model):
 
             # Example:
             #-------------------------------
-            result = contract.wage * 0.10
+            # result = contract.wage * 0.10
 
             """,
     )
@@ -160,6 +159,11 @@ class HrSalaryRule(models.Model):
     )
     input_ids = fields.One2many("hr.rule.input", "input_id", string="Inputs", copy=True)
     note = fields.Text(string="Description")
+    require_code_and_category = fields.Boolean(
+        "Require code and category",
+        compute="_compute_require_code_and_category",
+        default=lambda self: self._compute_require_code_and_category(),
+    )
 
     @api.constrains("parent_rule_id")
     def _check_parent_rule_id(self):
@@ -178,77 +182,93 @@ class HrSalaryRule(models.Model):
             children_rules += rule.child_ids._recursive_search_of_rules()
         return [(rule.id, rule.sequence) for rule in self] + children_rules
 
+    def _reset_localdict_values(self, localdict):
+        localdict["result_name"] = None
+        localdict["result_qty"] = 1.0
+        localdict["result_rate"] = 100
+        localdict["result"] = None
+        return localdict
+
+    def _compute_require_code_and_category(self):
+        require = (
+            self.env["ir.config_parameter"]
+            .sudo()
+            .get_param("payroll.require_code_and_category")
+        )
+        self.require_code_and_category = require
+        return require
+
     # TODO should add some checks on the type of result (should be float)
     def _compute_rule(self, localdict):
         """
         :param localdict: dictionary containing the environement in which to
                           compute the rule
-        :return: returns a tuple build as the base/amount computed, the quantity
-                 and the rate
-        :rtype: (float, float, float)
+        :return: returns a dict with values for the payslip line.
+                 The dict should minimum have "name", "quantity", "rate" and "amount".
+        :rtype: {"name": string, "quantity": float, "rate": float, "amount": float}
         """
         self.ensure_one()
-        if self.amount_select == "fix":
-            try:
-                return (
-                    self.amount_fix,
-                    float(safe_eval(self.quantity, localdict)),
-                    100.0,
-                    False,  # result_name is always False if not computed by python.
+        method = "_compute_rule_{}".format(self.amount_select)
+        return api.call_kw(self, method, [self.ids, localdict], {})
+
+    def _compute_rule_fix(self, localdict):
+        try:
+            return {
+                "name": self.name,
+                "quantity": float(safe_eval(self.quantity, localdict)),
+                "rate": 100.0,
+                "amount": self.amount_fix,
+            }
+        except Exception:
+            raise UserError(
+                _("Wrong quantity defined for salary rule %s (%s) for employee %s.")
+                % (self.name, self.code, localdict["employee"].name)
+            )
+
+    def _compute_rule_percentage(self, localdict):
+        try:
+            return {
+                "name": self.name,
+                "quantity": float(safe_eval(self.quantity, localdict)),
+                "rate": self.amount_percentage,
+                "amount": float(safe_eval(self.amount_percentage_base, localdict)),
+            }
+        except Exception:
+            raise UserError(
+                _(
+                    "Wrong percentage base or quantity defined for salary "
+                    "rule %s (%s) for employee %s."
                 )
-            except Exception:
-                raise UserError(
-                    _("Wrong quantity defined for salary rule %s (%s).")
-                    % (self.name, self.code)
-                )
-        elif self.amount_select == "percentage":
-            try:
-                return (
-                    float(safe_eval(self.amount_percentage_base, localdict)),
-                    float(safe_eval(self.quantity, localdict)),
-                    self.amount_percentage,
-                    False,  # result_name is always False if not computed by python.
-                )
-            except Exception:
-                raise UserError(
-                    _(
-                        "Wrong percentage base or quantity defined for salary "
-                        "rule %s (%s)."
-                    )
-                    % (self.name, self.code)
-                )
-        else:
-            try:
-                safe_eval(
-                    self.amount_python_compute, localdict, mode="exec", nocopy=True
-                )
-                result_qty = 1.0
-                result_rate = 100.0
-                result_name = False
-                if "result_name" in localdict:
-                    result_name = localdict["result_name"]
-                if "result_qty" in localdict:
-                    result_qty = localdict["result_qty"]
-                if "result_rate" in localdict:
-                    result_rate = localdict["result_rate"]
-                return (
-                    float(localdict["result"]),
-                    float(result_qty),
-                    float(result_rate),
-                    result_name,
-                )
-            except Exception as ex:
-                raise UserError(
-                    _(
-                        """
-Wrong python code defined for salary rule %s (%s).
+                % (self.name, self.code, localdict["employee"].name)
+            )
+
+    def _compute_rule_code(self, localdict):
+        try:
+            safe_eval(self.amount_python_compute, localdict, mode="exec", nocopy=True)
+            return self._get_rule_dict(localdict)
+        except Exception as ex:
+            raise UserError(
+                _(
+                    """
+Wrong python code defined for salary rule %s (%s) for employee %s.
 Here is the error received:
 
 %s
 """
-                    )
-                    % (self.name, self.code, repr(ex))
                 )
+                % (self.name, self.code, localdict["employee"].name, repr(ex))
+            )
+
+    def _get_rule_dict(self, localdict):
+        name = localdict.get("result_name") or self.name
+        quantity = float(localdict["result_qty"]) if "result_qty" in localdict else 1.0
+        rate = float(localdict["result_rate"]) if "result_rate" in localdict else 100.0
+        return {
+            "name": name,
+            "quantity": quantity,
+            "rate": rate,
+            "amount": float(localdict["result"]),
+        }
 
     def _satisfy_condition(self, localdict):
         """
@@ -257,34 +277,43 @@ Here is the error received:
                  given contract. Return False otherwise.
         """
         self.ensure_one()
+        method = "_satisfy_condition_{}".format(self.condition_select)
+        if self.parent_rule_id:
+            current_result = api.call_kw(self, method, [self.ids, localdict], {})
+            parent_result = self.parent_rule_id._satisfy_condition(localdict)
+            return current_result and parent_result
+        return api.call_kw(self, method, [self.ids, localdict], {})
 
-        if self.condition_select == "none":
-            return True
-        elif self.condition_select == "range":
-            try:
-                result = safe_eval(self.condition_range, localdict)
-                return (
-                    self.condition_range_min <= result <= self.condition_range_max
-                    or False
+    def _satisfy_condition_none(self, localdict):
+        return True
+
+    def _satisfy_condition_range(self, localdict):
+        try:
+            result = safe_eval(self.condition_range, localdict)
+            return (
+                self.condition_range_min <= result <= self.condition_range_max or False
+            )
+        except Exception:
+            raise UserError(
+                _(
+                    "Wrong range condition defined for salary rule %s (%s) for employee %s."
                 )
-            except Exception:
-                raise UserError(
-                    _("Wrong range condition defined for salary rule %s (%s).")
-                    % (self.name, self.code)
-                )
-        else:  # python code
-            try:
-                safe_eval(self.condition_python, localdict, mode="exec", nocopy=True)
-                return "result" in localdict and localdict["result"] or False
-            except Exception as ex:
-                raise UserError(
-                    _(
-                        """
-Wrong python condition defined for salary rule %s (%s).
+                % (self.name, self.code, localdict["employee"].name)
+            )
+
+    def _satisfy_condition_python(self, localdict):
+        try:
+            safe_eval(self.condition_python, localdict, mode="exec", nocopy=True)
+            return "result" in localdict and localdict["result"] or False
+        except Exception as ex:
+            raise UserError(
+                _(
+                    """
+Wrong python condition defined for salary rule %s (%s) for employee %s.
 Here is the error received:
 
 %s
 """
-                    )
-                    % (self.name, self.code, repr(ex))
                 )
+                % (self.name, self.code, localdict["employee"].name, repr(ex))
+            )
